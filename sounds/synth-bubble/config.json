@@ -1,0 +1,16 @@
+{
+  "id": "synth-bubble",
+  "name": "Bubble Pop (synth)",
+  "key_define_type": "multi",
+  "version": 2,
+  "sound": "press/GENERIC_R{0-4}.wav",
+  "soundup": "release/GENERIC.wav",
+  "defines": {
+    "14": "press/BACKSPACE.wav",
+    "14-up": "release/BACKSPACE.wav",
+    "28": "press/ENTER.wav",
+    "28-up": "release/ENTER.wav",
+    "57": "press/SPACE.wav",
+    "57-up": "release/SPACE.wav"
+  }
+}
