@@ -6,7 +6,6 @@ costs no CPU and lets the audio device sleep. Resuming takes about 1 ms.
 
 from __future__ import annotations
 
-import ctypes
 import logging
 import threading
 from dataclasses import dataclass
@@ -14,6 +13,7 @@ from dataclasses import dataclass
 import numpy as np
 import sounddevice as sd
 
+from .audiodevice import ensure_com
 from .dsp import soft_clip
 
 log = logging.getLogger(__name__)
@@ -22,18 +22,6 @@ SAMPLE_RATE = 44100
 CHANNELS = 2
 MAX_VOICES = 24
 IDLE_PAUSE_S = 5.0
-COINIT_MULTITHREADED = 0x0
-
-_com_threads = threading.local()
-
-
-def ensure_com() -> None:
-    """WASAPI needs COM on whichever thread starts a stream; worker threads lack it."""
-    if getattr(_com_threads, "ready", False):
-        return
-    # S_OK, S_FALSE (already on) and RPC_E_CHANGED_MODE (on, other model) all leave COM usable.
-    ctypes.windll.ole32.CoInitializeEx(None, COINIT_MULTITHREADED)
-    _com_threads.ready = True
 
 
 @dataclass
@@ -73,35 +61,45 @@ def pick_output() -> tuple[int | None, int]:
 
 
 class Mixer:
-    """Plays overlapping one-shot sounds. ``play`` is safe from any thread."""
+    """Plays overlapping one-shot sounds. ``play`` is safe from any thread.
+
+    Sounds are dropped, not queued, while no stream is open (audio down, or being
+    switched to another device), so nothing stale plays in a burst afterwards.
+    """
 
     def __init__(self, channels: int = CHANNELS):
         self.device, self.samplerate = pick_output()
         self.channels = channels
         self.master = 0.7
         self._voices: list[Voice] = []
-        self._lock = threading.Lock()          # guards voices and pause state
-        self._resume_lock = threading.Lock()   # serialises stream restarts
+        self._lock = threading.Lock()           # guards voices and pause state
+        self._stream_lock = threading.RLock()   # serialises everything that opens/closes/resumes the stream
         self._stream = None
         self._idle_frames = 0
         self._paused = False
+        self.degraded = False   # running on the slow fallback path although a fast one exists
         self.last_error: str | None = None
 
     # -- stream lifecycle ------------------------------------------------- #
     def start(self) -> bool:
         """Open the preferred device, falling back to the system default."""
-        self.stop()
-        for device in dict.fromkeys([self.device, None]):
-            try:
-                self._stream = self._open(device)
-            except Exception as exc:  # PortAudio raises a variety of error types
-                self.last_error = str(exc)
-                log.warning("Audio output on device %s failed: %s", device, exc)
-                continue
-            self.last_error = None
-            return True
-        log.error("No audio output could be started")
-        return False
+        with self._stream_lock:
+            self.stop()
+            ensure_com()
+            for device in dict.fromkeys([self.device, None]):
+                try:
+                    self._stream = self._open(device)
+                except Exception as exc:  # PortAudio raises a variety of error types
+                    self.last_error = str(exc)
+                    log.warning("Audio output on device %s failed: %s", device, exc)
+                    continue
+                self.last_error = None
+                self.degraded = device is None and self.device is not None
+                if self.degraded:
+                    log.warning("Using the slower default audio path (about 100 ms delay)")
+                return True
+            log.error("No audio output could be started")
+            return False
 
     def _open(self, device: int | None):
         stream = sd.OutputStream(
@@ -118,33 +116,38 @@ class Mixer:
                  stream.latency * 1000)
         return stream
 
-    def restart(self) -> bool:
-        """Reopen on the current default device (after plugging in headphones, etc.).
+    def reopen_devices(self) -> None:
+        """Close the stream and re-scan the audio devices, ready for ``start``.
 
-        The sample rate may change; callers must reload sounds if it does.
+        PortAudio only learns about newly plugged-in devices, and renumbers the rest,
+        when it is re-initialised. That must happen on the thread that first
+        initialised it (the main thread), because COM setup is per thread. The sample
+        rate follows the new default device, so callers must reload sounds if it
+        changed.
         """
-        self.stop()
-        try:
-            sd._terminate()
-            sd._initialize()
-        except Exception as exc:
-            log.warning("PortAudio re-init failed: %s", exc)
-        self.device, self.samplerate = pick_output()
-        return self.start()
+        with self._stream_lock:
+            self.stop()
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception as exc:
+                log.warning("PortAudio re-init failed: %s", exc)
+            self.device, self.samplerate = pick_output()
 
     def stop(self) -> None:
-        stream, self._stream = self._stream, None
-        if stream is None:
-            return
-        try:
-            stream.stop()
-            stream.close()
-        except Exception as exc:
-            log.warning("Closing audio stream failed: %s", exc)
-        with self._lock:
-            self._voices = []
-            self._paused = False
-            self._idle_frames = 0
+        with self._stream_lock:
+            stream, self._stream = self._stream, None
+            if stream is None:
+                return
+            try:
+                stream.stop()
+                stream.close()
+            except Exception as exc:
+                log.warning("Closing audio stream failed: %s", exc)
+            with self._lock:
+                self._voices = []
+                self._paused = False
+                self._idle_frames = 0
 
     @property
     def running(self) -> bool:
@@ -154,8 +157,22 @@ class Mixer:
     def paused(self) -> bool:
         return self._paused
 
+    def needs_restart(self) -> bool:
+        """True when a stream exists but has died on its own (device unplugged, driver reset).
+
+        A stream that paused itself after idling is healthy, not dead."""
+        stream = self._stream
+        if stream is None or self._paused:
+            return False
+        try:
+            return not stream.active
+        except Exception:
+            return True
+
     # -- playback --------------------------------------------------------- #
     def play(self, samples: np.ndarray, gain: float = 1.0) -> None:
+        if self._stream is None:
+            return
         with self._lock:
             if len(self._voices) >= MAX_VOICES:
                 self._voices = self._voices[1:]
@@ -166,7 +183,9 @@ class Mixer:
             self._resume()
 
     def _resume(self) -> None:
-        with self._resume_lock:
+        if not self._stream_lock.acquire(blocking=False):
+            return  # the stream is being reopened; this one sound is not worth waiting for
+        try:
             stream = self._stream
             if not self._paused or stream is None:
                 return
@@ -179,6 +198,8 @@ class Mixer:
                 return
             with self._lock:
                 self._paused = False
+        finally:
+            self._stream_lock.release()
 
     def _callback(self, outdata, frames, _time, status) -> None:
         if status.output_underflow:

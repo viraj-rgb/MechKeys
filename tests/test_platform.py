@@ -1,4 +1,5 @@
 import numpy as np
+from conftest import FakeStream
 
 from mechkeys import winutil
 from mechkeys.icon import keycap_image, write_ico
@@ -24,6 +25,7 @@ def test_mixer_callback_writes_mixed_audio():
         output_underflow = False
 
     mixer = Mixer()
+    mixer._stream = FakeStream()
     mixer.master = 1.0
     mixer.play(np.full((8, 2), 0.5, np.float32))
     out = np.zeros((4, 2), np.float32)

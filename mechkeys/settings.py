@@ -67,22 +67,73 @@ def validate(settings: Settings) -> Settings:
     )
 
 
-def load(path: Path) -> Settings:
+def _backup_path(path: Path) -> Path:
+    return path.with_name(path.name + ".bak")
+
+
+def _pending_path(path: Path) -> Path:
+    return path.with_name(path.name + ".tmp")
+
+
+def _parse(path: Path) -> Settings | None:
+    """Settings from one file, or None when it is missing, unreadable or not a settings object."""
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return Settings()
+        return None
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-        log.warning("Ignoring unreadable settings file %s: %s", path, exc)
-        return Settings()
+        log.warning("Cannot read settings file %s: %s", path, exc)
+        return None
     if not isinstance(raw, dict):
-        return Settings()
+        log.warning("Settings file %s is not a JSON object", path)
+        return None
     known = {f.name for f in fields(Settings)}
     return validate(Settings(**{k: v for k, v in raw.items() if k in known}))
 
 
+def _quarantine(path: Path) -> None:
+    """Move an unreadable settings file aside so the next save can never silently destroy it."""
+    if not path.exists():
+        return
+    target = path.with_name(path.stem + ".corrupt" + path.suffix)
+    try:
+        os.replace(path, target)
+        log.warning("Moved unreadable settings to %s", target)
+    except OSError as exc:
+        log.warning("Could not set aside %s: %s", path, exc)
+
+
+def load(path: Path) -> Settings:
+    """Load settings, surviving a crash at any point of a save.
+
+    A completed save leaves ``path``. A save interrupted mid-way leaves a finished
+    ``.tmp`` (newest) or only the ``.bak`` copy of the previous version, so those
+    are tried too, newest first.
+    """
+    for candidate in (_pending_path(path), path, _backup_path(path)):
+        settings = _parse(candidate)
+        if settings is None:
+            if candidate == path:
+                _quarantine(path)  # no-op when the file is merely missing
+            continue
+        if candidate != path:
+            log.warning("Recovered settings from %s", candidate.name)
+        return settings
+    return Settings()
+
+
 def save(path: Path, settings: Settings) -> None:
+    """Write settings so that no instant of the sequence can lose them.
+
+    New content goes to ``.tmp`` and is flushed to disk first; the previous file is
+    kept as ``.bak`` until the new one is in place.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(asdict(settings), indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    pending = _pending_path(path)
+    with open(pending, "w", encoding="utf-8") as out:
+        out.write(json.dumps(asdict(settings), indent=2))
+        out.flush()
+        os.fsync(out.fileno())
+    if path.exists():
+        os.replace(path, _backup_path(path))
+    os.replace(pending, path)

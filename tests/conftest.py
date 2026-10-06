@@ -37,3 +37,21 @@ def click() -> np.ndarray:
     t = np.arange(int(rate * 0.05)) / rate
     tone = (0.8 * np.sin(2 * np.pi * 900 * t) * np.exp(-t * 60)).astype(np.float32)
     return np.vstack([silence, np.column_stack([tone, tone])])
+
+
+class FakeStream:
+    """Stands in for a PortAudio stream: records stop/start calls and reports itself active."""
+
+    def __init__(self, active: bool = True):
+        self.calls = []
+        self.active = active
+
+    def stop(self):
+        self.calls.append("stop")
+
+    def start(self):
+        self.calls.append("start")
+
+    def close(self):
+        self.calls.append("close")
+

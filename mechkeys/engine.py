@@ -9,19 +9,21 @@ import threading
 import time
 from typing import Callable
 
+from .audiodevice import DeviceWatcher
+from .dsp import make_mouse_clicks, vary_pitch
 from .hook import KeyboardHook, KeyEvent
 from .keycodes import to_mechvibes_code
-from .dsp import make_mouse_clicks, vary_pitch
 from .mixer import Mixer
 from .mouse import BACK, FORWARD, LEFT, MIDDLE, RIGHT, MouseEvent, MouseListener
 from .settings import MAX_VOLUME, Settings
-from .soundpack import PackInfo, SoundPack, load_pack
+from .soundpack import PackInfo, SoundPack, SoundPackError, load_pack
 
 log = logging.getLogger(__name__)
 
 VK_M = 0x4D
 CTRL_VKS = frozenset({0x11, 0xA2, 0xA3})
 ALT_VKS = frozenset({0x12, 0xA4, 0xA5})
+MAX_FAST_PATH_RETRIES = 3     # tries to get back onto low-latency audio after falling back to the slow path
 REPEAT_WINDOW_S = 1.1        # longer than Windows' max initial auto-repeat delay
 GAIN_JITTER = (0.9, 1.0)
 # Bigger buttons sound a little lower, like on a real mouse.
@@ -51,9 +53,18 @@ class RepeatFilter:
 
 
 class SoundEngine:
-    def __init__(self, settings: Settings, on_mute_hotkey: Callable[[], None]):
+    def __init__(self, settings: Settings, on_mute_hotkey: Callable[[], None],
+                 post: Callable[[Callable[[], None]], None] | None = None,
+                 on_audio_state: Callable[[bool], None] | None = None):
+        """`post` runs a callable on the main (UI) thread - audio devices must be re-scanned
+        there. `on_audio_state(ok)` is told whether audio came back after a device change."""
         self._settings = settings
         self._on_mute_hotkey = on_mute_hotkey
+        self._post = post or (lambda action: action())
+        self._on_audio_state = on_audio_state or (lambda ok: None)
+        self._restart_pending = False
+        self._restart_lock = threading.Lock()
+        self._fast_path_tries = 0
         self._pack: SoundPack | None = None
         self._events: queue.SimpleQueue[KeyEvent | MouseEvent | None] = queue.SimpleQueue()
         self._repeats = RepeatFilter()
@@ -63,6 +74,8 @@ class SoundEngine:
         self.mixer = Mixer()
         self.hook = KeyboardHook(self._events.put)
         self.mouse = MouseListener(self._events.put)
+        self._watcher = DeviceWatcher(on_change=self._request_audio_restart,
+                                      is_audio_dead=self._audio_needs_attention)
         self._mouse_style = settings.mouse_style
         self._mouse_clicks = self._make_clicks()
         self._started = False
@@ -74,6 +87,7 @@ class SoundEngine:
     # -- lifecycle -------------------------------------------------------- #
     def start(self) -> tuple[bool, bool]:
         """Start audio and the hook; returns (audio_ok, hook_ok)."""
+        self._watcher.start()  # records the current output device before the stream opens on it
         audio_ok = self.mixer.start()
         self._worker.start()
         hook_ok = self.hook.start()
@@ -82,17 +96,57 @@ class SoundEngine:
         return audio_ok, hook_ok
 
     def restart_audio(self) -> bool:
-        """Reopen audio on the current default device, resampling the pack if needed."""
+        """Reopen audio on the current default device. Call on the main thread.
+
+        Sounds are resampled for the new device when its sample rate differs; until
+        the stream is reopened, key presses are dropped rather than played too fast
+        or too slow.
+        """
         old_rate = self.mixer.samplerate
-        ok = self.mixer.restart()
+        self.mixer.reopen_devices()
         if self.mixer.samplerate != old_rate:
             self._mouse_clicks = self._make_clicks()
             if self._pack is not None:
-                self.load_pack(self._pack.info)
-        return ok
+                try:
+                    self.load_pack(self._pack.info)
+                except SoundPackError as exc:
+                    log.error("Could not reload '%s' at %d Hz: %s", self._pack.info.name,
+                              self.mixer.samplerate, exc)
+                    self._pack = None  # silence beats sounds at the wrong pitch
+        return self.mixer.start()
 
+    def _audio_needs_attention(self) -> bool:
+        """Watcher thread: is audio down, or stuck on the slow fallback path with retries left?"""
+        mixer = self.mixer
+        if not mixer.running or mixer.needs_restart():
+            return True
+        return mixer.degraded and self._fast_path_tries < MAX_FAST_PATH_RETRIES
+
+    def _request_audio_restart(self, reason: str) -> None:
+        """Watcher thread: ask the main thread to reopen audio (once, however often asked)."""
+        with self._restart_lock:
+            if self._restart_pending:
+                return
+            self._restart_pending = True
+        if reason == "default output changed":
+            self._fast_path_tries = 0
+        log.info("Reopening audio: %s", reason)
+        self._post(self._restart_audio_now)
+
+    def _restart_audio_now(self) -> None:
+        try:
+            ok = self.restart_audio()
+        except Exception:
+            log.exception("Reopening audio failed")
+            ok = False
+        finally:
+            with self._restart_lock:
+                self._restart_pending = False
+        self._fast_path_tries = self._fast_path_tries + 1 if self.mixer.degraded else 0
+        self._on_audio_state(ok)
     def stop(self) -> None:
         self._started = False
+        self._watcher.stop()
         self.mouse.stop()
         self.hook.stop()
         self._events.put(None)

@@ -34,6 +34,8 @@ Add `--minimized` to start hidden in the tray.
 |---|---|
 | System-wide | A low-level keyboard hook hears keys in every app. It only listens and never blocks or changes your input. |
 | Low latency | WASAPI shared-mode output (about 10–25 ms), with MME as the fallback. |
+| Follows your audio output | Switch from speakers to a headset (or plug one in) and MechKeys moves over by itself within about a second. It also recovers if the device is unplugged, restarts, or isn't ready yet at login. No restart needed. |
+| Remembers everything | Volume, mute, pack, mouse style and every option are saved the moment you change them (sliders within 0.25 s) and restored on the next start. Saves are crash-safe: a backup is kept, and an unreadable settings file is set aside rather than overwritten. |
 | Per-key sounds | Each key plays its own sample from the pack's `config.json`, including arrows, numpad and modifiers. |
 | Volume and mute | 0–200%. Anything above 100% is a boost (about 3× at 200%), and a soft limiter keeps loud chords from crackling. A slider in the window, presets in the tray menu, and **Ctrl+Alt+M** from anywhere. |
 | Key release sound | Plays a softer, brighter `clack` when a key comes back up. It's made from each key's press sample, and its loudness is adjustable (0 turns it off). |
@@ -62,7 +64,7 @@ Measured in the tray on a 24-core PC:
 
 ## Files
 
-- Settings: `%APPDATA%\MechKeys\settings.json`
+- Settings: `%APPDATA%\MechKeys\settings.json` (plus `settings.json.bak`, the previous version)
 - Imported packs: `%APPDATA%\MechKeys\packs\`
 - Log: `%APPDATA%\MechKeys\mechkeys.log`
 
@@ -86,6 +88,7 @@ python -m pytest --cov=mechkeys      # tests
 | `app.py` | Controller: settings, threading, window and tray wiring |
 | `ui.py`, `widgets.py` | Tk settings window and custom dark widgets |
 | `tray.py` | `pystray` icon and menu |
+| `audiodevice.py` | Watches the Windows default output device (COM) and COM setup for audio threads |
 | `winutil.py` | Autostart, single instance, DPI awareness |
 
 Recorded packs come from the Mechvibes project (MIT). Run `python tools/fetch_mechvibes_packs.py` to download them again.

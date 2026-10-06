@@ -25,7 +25,8 @@ log = logging.getLogger("mechkeys")
 TASK_POLL_MS = 30           # while the window is open
 TASK_POLL_HIDDEN_MS = 120   # in the tray: fewer wakeups, still snappy for menu clicks
 TICK_MS = 400
-SAVE_DELAY_MS = 500
+SAVE_THROTTLE_MS = 250     # slider drags: write at most this often, so a kill loses almost nothing
+SAVE_RETRY_MS = 2000        # a failed write (file briefly locked, say) is retried
 LOG_BYTES = 256 * 1024
 
 
@@ -57,7 +58,8 @@ class App:
         self._told_about_tray = False
         self._closing = False
 
-        self.engine = SoundEngine(self.settings, on_mute_hotkey=lambda: self.post(self._hotkey_mute))
+        self.engine = SoundEngine(self.settings, on_mute_hotkey=lambda: self.post(self._hotkey_mute),
+                                  post=self.post, on_audio_state=self._audio_state_changed)
         self.root = tk.Tk()
         self.root.withdraw()
         self._load_initial_pack()
@@ -102,7 +104,11 @@ class App:
             self.show_window()
         self.root.after(TASK_POLL_MS, self._pump)
         self.root.after(TICK_MS, self._tick)
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:  # a crash in the UI loop must not cost the user their settings
+            if not self._closing:
+                self._write_settings()
 
     # -- threading -------------------------------------------------------- #
     def post(self, action: Callable[[], None]) -> None:
@@ -148,31 +154,42 @@ class App:
     def clicks(self) -> int:
         return self.engine.clicks
 
-    def _update(self, **changes) -> None:
+    def _update(self, *, defer_save: bool = False, **changes) -> None:
+        """Apply setting changes. They hit the disk at once, except while a slider is
+        being dragged (``defer_save``), when writes are throttled instead."""
         updated = self.settings.with_changes(**changes)
         if updated == self.settings:
             return
         self.settings = updated
         self.engine.apply_settings(updated)
-        self._schedule_save()
+        if defer_save:
+            self._schedule_save()
+        else:
+            self._save()
         self.window.refresh()
         self.tray.refresh()
 
-    def _schedule_save(self) -> None:
-        if self._save_job:
-            self.root.after_cancel(self._save_job)
-        self._save_job = self.root.after(SAVE_DELAY_MS, self._save)
+    def _schedule_save(self, delay_ms: int = SAVE_THROTTLE_MS) -> None:
+        if self._save_job is None:  # keep the pending write: a long drag still saves every delay
+            self._save_job = self.root.after(delay_ms, self._save)
 
-    def _save(self) -> None:
-        self._save_job = None
+    def _write_settings(self) -> bool:
         try:
             settings_store.save(self.settings_path, self.settings)
         except OSError as exc:
             log.error("Saving settings failed: %s", exc)
+            return False
+        return True
 
+    def _save(self) -> None:
+        job, self._save_job = self._save_job, None
+        if job:
+            self.root.after_cancel(job)
+        if not self._write_settings() and not self._closing:
+            self._schedule_save(SAVE_RETRY_MS)
     # -- actions (called on the Tk thread) -------------------------------- #
     def set_volume(self, volume: int) -> None:
-        self._update(volume=volume, muted=False)
+        self._update(volume=volume, muted=False, defer_save=True)
 
     def toggle_mute(self) -> None:
         self._update(muted=not self.settings.muted)
@@ -183,17 +200,18 @@ class App:
             self.tray.notify("Muted" if self.settings.muted else f"Sound on — {self.settings.volume}%")
 
     def set_pitch(self, percent: int) -> None:
-        self._update(pitch_variation=percent)
+        self._update(pitch_variation=percent, defer_save=True)
 
     def set_mouse_volume(self, percent: int) -> None:
-        self._update(mouse_volume=percent, mouse_sounds=percent > 0 or self.settings.mouse_sounds)
+        self._update(mouse_volume=percent, mouse_sounds=percent > 0 or self.settings.mouse_sounds,
+                     defer_save=True)
 
     def set_mouse_style(self, style: str) -> None:
         self._update(mouse_style=style, mouse_sounds=True)
         self.engine.preview_mouse()
 
     def set_release_volume(self, percent: int) -> None:
-        self._update(release_volume=percent)
+        self._update(release_volume=percent, defer_save=True)
 
     def select_pack(self, pack_id: str) -> None:
         info = next((p for p in self.packs if p.pack_id == pack_id), None)
@@ -236,13 +254,16 @@ class App:
                 return
         self._update(**{name: value})
 
-    def restart_audio(self) -> None:
-        try:
-            self._audio_ok = self.engine.restart_audio()
-        except SoundPackError as exc:
-            log.error("Reloading pack after audio restart failed: %s", exc)
+    def _audio_state_changed(self, ok: bool) -> None:
+        """The engine reopened (or failed to reopen) audio, e.g. after the output device changed."""
+        if self._closing:
+            return
+        self._audio_ok = ok
         self.window.refresh()
         self.tray.refresh()
+
+    def restart_audio(self) -> None:
+        self._audio_state_changed(self.engine.restart_audio())
         self.tray.notify("Audio restarted" if self._audio_ok else "Still no audio output device")
 
     def show_window(self) -> None:
@@ -269,8 +290,6 @@ class App:
         if self._closing:
             return
         self._closing = True
-        if self._save_job:
-            self.root.after_cancel(self._save_job)
         self._save()
         self.engine.stop()
         self.tray.stop()
